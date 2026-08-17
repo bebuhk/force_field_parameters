@@ -1,0 +1,33 @@
+atom_type,element,R0_ang,D0_kcal_mol,zeta,source,note
+H,H,3.195,0.0152,12.382,n-hexane crystal,
+H__b,H,3.195,0.0152,12.382,interpolation,bridging hydrogen variant
+H_HB,H,3.195,0.0001,12.0,H2O dimer,hydrogen-bonding hydrogen variant
+B,B,4.02,0.095,14.23,interpolation,
+C,C,3.8983,0.0951,14.034,Williams,
+N,N,3.6621,0.0774,13.843,Williams,
+O,O,3.4046,0.0957,13.483,Williams,
+F,F,3.4720,0.0725,14.444,Williams,
+Al,Al,4.39,0.31,12.0,interpolation,
+Si,Si,4.27,0.31,12.0,interpolation,
+P,P,4.1500,0.3200,12.0,P4 crystal,
+S,S,4.0300,0.3440,12.0,S8 crystal,
+Cl,Cl,3.9503,0.2833,13.861,Williams,
+Ga,Ga,4.39,0.40,12.0,interpolation,
+Ge,Ge,4.27,0.40,12.0,interpolation,
+As,As,4.15,0.41,12.0,interpolation,
+Se,Se,4.03,0.43,12.0,interpolation,
+Br,Br,3.95,0.37,12.0,interpolation,
+In,In,4.59,0.55,12.0,interpolation,
+Sn,Sn,4.47,0.55,12.0,interpolation,
+Sb,Sb,4.35,0.55,12.0,interpolation,
+Te,Te,4.23,0.57,12.0,interpolation,
+I,I,4.15,0.51,12.0,interpolation,
+Na+,Na,3.144,0.5,12.0,DREIDING/A,ionic (Na+)
+Ca2+,Ca,3.472,0.05,12.0,DREIDING/A,ionic (Ca2+)
+Fe2+,Fe,4.54,0.055,12.0,DREIDING/A,ionic (Fe2+)
+Zn2+,Zn,4.54,0.055,12.0,DREIDING/A,ionic (Zn2+)
+C_R1,C,4.23,0.1356,14.034,benzene crystal,implicit-hydrogen carbon (aromatic)
+C_34,C,4.2370,0.3016,12.0,CH4 crystal,implicit-hydrogen carbon (CH3-like)
+C_33,C,4.1524,0.2500,12.0,interpolation,implicit-hydrogen carbon
+C_32,C,4.0677,0.1984,12.0,interpolation,implicit-hydrogen carbon
+C_31,C,3.9830,0.1467,12.0,interpolation,implicit-hydrogen carbon

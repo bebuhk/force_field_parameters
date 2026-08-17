@@ -1,0 +1,13 @@
+[project]
+name = "force-field-parameters"
+version = "0.1.0"
+description = "Force field parameter checking and generation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "jinja2",
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "ipykernel",
+]
