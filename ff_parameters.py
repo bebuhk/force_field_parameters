@@ -268,7 +268,7 @@ def _(pd, re):
 
 
 @app.cell
-def _(Template, io, json, parse_def, pd):
+def _(Template, json, parse_def, pd):
     def parse_template(text: str) -> pd.DataFrame:
         """Parse a RASPA3 ``.template`` (Jinja2-rendered JSON) into a DataFrame
         with columns ``element``, ``epsilon_K``, ``sigma_ang``, ``source``,
@@ -294,17 +294,30 @@ def _(Template, io, json, parse_def, pd):
 
 
     def parse_dat(text: str) -> pd.DataFrame:
-        """Parse a plain whitespace-columns ``.dat`` file (``element sigma_ang
-        epsilon_K mass_amu``, no header). These files only ever contain UFF
-        parameters in ``ff_data``, so ``source`` is fixed to ``"UFF"``."""
-        df = pd.read_csv(
-            io.StringIO(text),
-            sep=r"\s+",
-            header=None,
-            names=["element", "sigma_ang", "epsilon_K", "mass_amu"],
-        )
-        df["source"] = "UFF"
-        return df
+        """Parse a whitespace-columns ``.dat`` file (``element sigma_ang
+        epsilon_K mass_amu``, no header). A trailing ``// <source>`` comment on
+        a line (as written by this notebook's export) is kept as that row's
+        source; lines without one default to ``"UFF"``, matching the plain
+        UFF-only .dat files in ``ff_data``. Blank lines and ``#``-prefixed
+        comment lines are ignored."""
+        rows = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            line, _, comment = line.partition("//")
+            fields = line.split()
+            if not fields:
+                continue
+            element, sigma_ang, epsilon_K, mass_amu = fields[:4]
+            rows.append({
+                "element": element,
+                "sigma_ang": float(sigma_ang),
+                "epsilon_K": float(epsilon_K),
+                "mass_amu": float(mass_amu),
+                "source": comment.strip() or "UFF",
+            })
+        return pd.DataFrame(rows, columns=["element", "sigma_ang", "epsilon_K", "mass_amu", "source"])
 
 
     PARSERS = {".def": parse_def, ".template": parse_template, ".dat": parse_dat}
