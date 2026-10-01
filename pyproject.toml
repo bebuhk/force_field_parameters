@@ -10,4 +10,5 @@ dependencies = [
     "numpy",
     "pandas",
     "ipykernel",
+    "marimo>=0.25.0",
 ]
