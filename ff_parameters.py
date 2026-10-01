@@ -11,6 +11,7 @@ def _():
     import re
     import json
     import math
+    import warnings
     from pathlib import Path
 
     import numpy as np
@@ -22,7 +23,20 @@ def _():
     pd.set_option("display.max_columns", None)
     pd.set_option("display.width", None)
     pd.set_option("display.max_colwidth", None)
-    return Line2D, Path, Template, io, json, math, mo, np, pd, plt, re
+    return (
+        Line2D,
+        Path,
+        Template,
+        io,
+        json,
+        math,
+        mo,
+        np,
+        pd,
+        plt,
+        re,
+        warnings,
+    )
 
 
 @app.cell
@@ -298,29 +312,162 @@ def _(Template, io, json, parse_def, pd):
 
 
 @app.cell
-def _(PARSERS, Path, file_browser, file_upload, mo):
-    if file_upload.value:
-        active_name = file_upload.name()
-        active_text = file_upload.contents().decode("utf-8")
-    elif file_browser.value:
-        active_name = file_browser.name()
-        active_text = file_browser.path().read_text()
-    else:
-        active_name = None
-        active_text = None
+def _(KCAL_PER_MOL_TO_K, PARSERS, io, pd):
+    def parse_csv(text: str) -> pd.DataFrame:
+        """Parse one of this repo's ground-truth literature CSVs (UFF Table I or
+        DREIDING Table II shape) into the common element/sigma_ang/epsilon_K/
+        source shape used elsewhere in this notebook."""
+        raw = pd.read_csv(io.StringIO(text))
 
-    mo.stop(
-        active_name is None,
-        mo.md("**Select a file above (or upload one) to compare.**"),
-    )
+        if "nonbond_distance_x1_ang" in raw.columns:
+            assert (
+                raw.groupby("element")[["nonbond_distance_x1_ang", "nonbond_energy_D1_kcal_mol"]]
+                .nunique().le(1).all().all()
+            ), "UFF nonbond parameters are not constant within an element; dedup would be lossy"
+            out = raw.drop_duplicates(subset=["element"]).reset_index(drop=True)
+            out["sigma_ang"] = out["nonbond_distance_x1_ang"] / 2 ** (1 / 6)
+            out["epsilon_K"] = out["nonbond_energy_D1_kcal_mol"] * KCAL_PER_MOL_TO_K
+            out["source"] = "UFF"
+            return out[["element", "sigma_ang", "epsilon_K", "source"]]
 
-    active_suffix = Path(active_name).suffix
-    mo.stop(
-        active_suffix not in PARSERS,
-        mo.md(f"**Unsupported file type `{active_suffix}`** — expected one of {list(PARSERS)}."),
-    )
+        if "R0_ang" in raw.columns:
+            # Several atom types per element (implicit-H united atoms, ionic
+            # variants); prefer the explicit atom type, same rule as section 1.
+            ranked = raw.copy()
+            ranked["_is_explicit"] = ranked["atom_type"] == ranked["element"]
+            ranked = ranked.sort_values(["element", "_is_explicit"], ascending=[True, False], kind="stable")
+            out = ranked.drop_duplicates(subset=["element"], keep="first").reset_index(drop=True)
+            out["sigma_ang"] = out["R0_ang"] / 2 ** (1 / 6)
+            out["epsilon_K"] = out["D0_kcal_mol"] * KCAL_PER_MOL_TO_K
+            out["source"] = "DREIDING"
+            return out[["element", "sigma_ang", "epsilon_K", "source"]]
 
-    provided_raw = PARSERS[active_suffix](active_text)
+        raise ValueError(
+            "Unrecognized CSV schema — expected the UFF (`nonbond_distance_x1_ang` "
+            "column) or DREIDING (`R0_ang` column) ground-truth tables."
+        )
+
+
+    EXPORT_SOURCE_PARSERS = {**PARSERS, ".csv": parse_csv}
+    return (EXPORT_SOURCE_PARSERS,)
+
+
+@app.cell
+def _(json, pd, warnings):
+    def to_csv(df: pd.DataFrame) -> str:
+        """Serialize the canonical element/sigma_ang/epsilon_K/... dataframe to
+        CSV, keeping only the common columns that are actually present."""
+        cols = [c for c in ["element", "sigma_ang", "epsilon_K", "mass_amu", "source"] if c in df.columns]
+        return df[cols].to_csv(index=False)
+
+
+    def to_dat(df: pd.DataFrame) -> str:
+        """Serialize to the plain whitespace-columns ``.dat`` shape (``element
+        sigma_ang epsilon_K mass_amu``, no header, matching ``parse_dat``). Mass
+        is written as ``nan`` when the source format didn't carry it."""
+        if "mass_amu" not in df.columns:
+            warnings.warn("source has no mass_amu column; writing 'nan' for mass in the .dat export.")
+        lines = [
+            f"{row.element} {row.sigma_ang:.6g} {row.epsilon_K:.6g} {row.mass_amu if 'mass_amu' in df.columns else float('nan'):.6g}"
+            for row in df.itertuples()
+        ]
+        return "\n".join(lines) + "\n"
+
+
+    def to_def(df: pd.DataFrame) -> str:
+        """Serialize to a RASPA2-style ``force_field_mixing_rules.def`` (matching
+        ``parse_def``'s expectations: element + trailing ``_``, epsilon before
+        sigma, optional ``// source`` comment)."""
+        lines = [
+            "# general rule for shifted vs truncated",
+            "shifted",
+            "# general rule tailcorrections",
+            "no",
+            "# number of defined interactions",
+            str(len(df)),
+            "# type interaction, parameters.    IMPORTANT: define shortest matches first, so that more specific ones overwrites these",
+        ]
+        for row in df.itertuples():
+            name = f"{row.element}_"
+            source = getattr(row, "source", None)
+            comment = f"     // {source}" if isinstance(source, str) and source else ""
+            lines.append(f"{name:<14} lennard-jones   {row.epsilon_K:<10.6g} {row.sigma_ang:<10.6g}{comment}")
+        return "\n".join(lines) + "\n"
+
+
+    def to_template(df: pd.DataFrame) -> str:
+        """Serialize to a RASPA3 ``.template`` (Jinja2 + JSON, matching
+        ``parse_template``'s expectations). ``CutOff`` is kept as the
+        ``{{ cutoff_radius }}`` placeholder, same as the files in ``ff_data``."""
+        pseudo_atoms, self_interactions = [], []
+        for row in df.itertuples():
+            source = getattr(row, "source", None) or "unknown"
+            mass = getattr(row, "mass_amu", None)
+            mass = None if mass is None or pd.isna(mass) else float(mass)
+            pseudo_atoms.append({
+                "name": row.element,
+                "framework": True,
+                "print_to_output": True,
+                "element": row.element,
+                "print_as": row.element,
+                "mass": mass,
+                "charge": 0.0,
+                "source": source,
+            })
+            self_interactions.append({
+                "name": row.element,
+                "type": "lennard-jones",
+                "parameters": [row.epsilon_K, row.sigma_ang],
+                "source": source,
+            })
+        data = {
+            "PseudoAtoms": pseudo_atoms,
+            "SelfInteractions": self_interactions,
+            "MixingRule": "Lorentz-Berthelot",
+            "TruncationMethod": "truncated",
+            "CutOff": float("nan"),
+            "TailCorrections": True,
+        }
+        rendered = json.dumps(data, indent=2)
+        return rendered.replace('"CutOff": NaN', '"CutOff": {{ cutoff_radius }}', 1)
+
+
+    EXPORTERS = {".csv": to_csv, ".dat": to_dat, ".def": to_def, ".template": to_template}
+    return (EXPORTERS,)
+
+
+@app.cell
+def _(Path, mo):
+    def load_force_field_file(browser, upload, parsers):
+        """Resolve the active (name, suffix, parsed df) from a browser/upload
+        pair. Upload takes priority when both are set. Halts the cell (via
+        ``mo.stop``) with a helpful message if nothing is selected yet or the
+        extension isn't supported."""
+        if upload.value:
+            name = upload.name()
+            text = upload.contents().decode("utf-8")
+        elif browser.value:
+            name = browser.name()
+            text = browser.path().read_text()
+        else:
+            name = None
+            text = None
+
+        mo.stop(name is None, mo.md("**Select a file above (or upload one).**"))
+
+        suffix = Path(name).suffix
+        mo.stop(
+            suffix not in parsers,
+            mo.md(f"**Unsupported file type `{suffix}`** — expected one of {list(parsers)}."),
+        )
+        return name, suffix, parsers[suffix](text)
+
+    return (load_force_field_file,)
+
+
+@app.cell
+def _(PARSERS, file_browser, file_upload, load_force_field_file, mo):
+    active_name, active_suffix, provided_raw = load_force_field_file(file_browser, file_upload, PARSERS)
     mo.md(f"Loaded **{active_name}** as `{active_suffix}` ({len(provided_raw)} entries).")
     return (provided_raw,)
 
@@ -334,7 +481,7 @@ def _(mo):
 
 
 @app.cell
-def _(pd):
+def _(pd, warnings):
     def split_by_force_field(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Split provided parameters into the subset meant to be compared against
         UFF and the subset meant to be compared against DREIDING, based on the
@@ -347,20 +494,41 @@ def _(pd):
         return df[is_uff].copy(), df[is_dreiding].copy()
 
 
-    def normalize_elements(df: pd.DataFrame, ground_truth: pd.DataFrame) -> pd.DataFrame:
-        """Rename quirky element labels to match the ground truth (currently:
-        Lawrencium is "Lr" in some sources, "Lw" in UFF's own table)."""
+    def normalize_elements(df: pd.DataFrame, other: pd.DataFrame) -> pd.DataFrame:
+        """Rename quirky element labels to match ``other`` (currently: Lawrencium
+        is "Lr" in some sources, "Lw" in UFF's own table)."""
         df = df.copy()
-        if "Lw" in set(ground_truth["element"]) and "Lr" in set(df["element"]) and "Lw" not in set(df["element"]):
+        if "Lw" in set(other["element"]) and "Lr" in set(df["element"]) and "Lw" not in set(df["element"]):
             df["element"] = df["element"].replace({"Lr": "Lw"})
         return df
+
+
+    def dedupe_elements(df: pd.DataFrame, label: str) -> pd.DataFrame:
+        """Guard against a file defining more than one atom type per bare
+        element (e.g. several oxidation states collapsing to the same symbol).
+        An inner join on ``element`` would otherwise silently explode into a
+        many-to-many match; keep the first occurrence instead and warn."""
+        dup_mask = df["element"].duplicated(keep=False)
+        if dup_mask.any():
+            dup_elements = sorted(set(df.loc[dup_mask, "element"]))
+            warnings.warn(
+                f"{label} has multiple entries for the same element {dup_elements}; "
+                "keeping the first occurrence of each.",
+                stacklevel=2,
+            )
+        return df.drop_duplicates(subset=["element"], keep="first")
 
 
     def compute_errors(provided: pd.DataFrame, ground_truth: pd.DataFrame, suffix: str) -> pd.DataFrame:
         """Inner-join ``provided`` to ``ground_truth`` on element and compute
         signed error, absolute error, signed relative error, and absolute
-        relative error for sigma and epsilon."""
+        relative error for sigma and epsilon. Robust to the two sides using
+        different atom-type granularity: elements present on only one side are
+        simply dropped (inner join), and duplicate elements on either side are
+        deduped with a warning rather than exploding the join."""
         provided = normalize_elements(provided, ground_truth)
+        provided = dedupe_elements(provided, "provided force field")
+        ground_truth = dedupe_elements(ground_truth, f"ground truth{suffix}")
         merged = pd.merge(
             provided, ground_truth, on="element", how="inner", suffixes=("_provided", suffix)
         )
@@ -610,6 +778,14 @@ def _(
 
 
 @app.cell
+def _(pd):
+    def empty_outliers() -> pd.DataFrame:
+        return pd.DataFrame(columns=["element", "panel", "value", "deviation_std"])
+
+    return (empty_outliers,)
+
+
+@app.cell
 def _(mo):
     mo.md(r"""
     #### vs. UFF
@@ -618,18 +794,26 @@ def _(mo):
 
 
 @app.cell
-def _(compare_uff, mo, n_std_slider, plot_error_profile):
-    mo.stop(compare_uff is None, mo.md("*no UFF-labeled entries in this file*"))
-    fig_uff_sigma, outliers_uff_sigma = plot_error_profile(compare_uff, "sigma_ang", n_std=n_std_slider.value)
-    fig_uff_sigma
+def _(compare_uff, empty_outliers, mo, n_std_slider, plot_error_profile):
+    if compare_uff is not None:
+        fig_uff_sigma, outliers_uff_sigma = plot_error_profile(compare_uff, "sigma_ang", n_std=n_std_slider.value)
+        _output = fig_uff_sigma
+    else:
+        outliers_uff_sigma = empty_outliers()
+        _output = mo.md("*no UFF-labeled entries in this file*")
+    _output
     return (outliers_uff_sigma,)
 
 
 @app.cell
-def _(compare_uff, mo, n_std_slider, plot_error_profile):
-    mo.stop(compare_uff is None, mo.md("*no UFF-labeled entries in this file*"))
-    fig_uff_epsilon, outliers_uff_epsilon = plot_error_profile(compare_uff, "epsilon_K", n_std=n_std_slider.value)
-    fig_uff_epsilon
+def _(compare_uff, empty_outliers, mo, n_std_slider, plot_error_profile):
+    if compare_uff is not None:
+        fig_uff_epsilon, outliers_uff_epsilon = plot_error_profile(compare_uff, "epsilon_K", n_std=n_std_slider.value)
+        _output = fig_uff_epsilon
+    else:
+        outliers_uff_epsilon = empty_outliers()
+        _output = mo.md("*no UFF-labeled entries in this file*")
+    _output
     return (outliers_uff_epsilon,)
 
 
@@ -642,18 +826,26 @@ def _(mo):
 
 
 @app.cell
-def _(compare_dreiding, mo, n_std_slider, plot_error_profile):
-    mo.stop(compare_dreiding is None, mo.md("*no DREIDING-labeled entries in this file*"))
-    fig_dreiding_sigma, outliers_dreiding_sigma = plot_error_profile(compare_dreiding, "sigma_ang", n_std=n_std_slider.value)
-    fig_dreiding_sigma
+def _(compare_dreiding, empty_outliers, mo, n_std_slider, plot_error_profile):
+    if compare_dreiding is not None:
+        fig_dreiding_sigma, outliers_dreiding_sigma = plot_error_profile(compare_dreiding, "sigma_ang", n_std=n_std_slider.value)
+        _output = fig_dreiding_sigma
+    else:
+        outliers_dreiding_sigma = empty_outliers()
+        _output = mo.md("*no DREIDING-labeled entries in this file*")
+    _output
     return (outliers_dreiding_sigma,)
 
 
 @app.cell
-def _(compare_dreiding, mo, n_std_slider, plot_error_profile):
-    mo.stop(compare_dreiding is None, mo.md("*no DREIDING-labeled entries in this file*"))
-    fig_dreiding_epsilon, outliers_dreiding_epsilon = plot_error_profile(compare_dreiding, "epsilon_K", n_std=n_std_slider.value)
-    fig_dreiding_epsilon
+def _(compare_dreiding, empty_outliers, mo, n_std_slider, plot_error_profile):
+    if compare_dreiding is not None:
+        fig_dreiding_epsilon, outliers_dreiding_epsilon = plot_error_profile(compare_dreiding, "epsilon_K", n_std=n_std_slider.value)
+        _output = fig_dreiding_epsilon
+    else:
+        outliers_dreiding_epsilon = empty_outliers()
+        _output = mo.md("*no DREIDING-labeled entries in this file*")
+    _output
     return (outliers_dreiding_epsilon,)
 
 
@@ -667,25 +859,21 @@ def _(mo):
 
 @app.cell
 def _(
-    compare_dreiding,
-    compare_uff,
     outliers_dreiding_epsilon,
     outliers_dreiding_sigma,
     outliers_uff_epsilon,
     outliers_uff_sigma,
     pd,
 ):
-    _tables = [
-        t.assign(force_field=ff_name)
-        for t, ff_name in [
-            (outliers_uff_sigma if compare_uff is not None else None, "UFF"),
-            (outliers_uff_epsilon if compare_uff is not None else None, "UFF"),
-            (outliers_dreiding_sigma if compare_dreiding is not None else None, "DREIDING"),
-            (outliers_dreiding_epsilon if compare_dreiding is not None else None, "DREIDING"),
-        ]
-        if t is not None
-    ]
-    all_outliers = pd.concat(_tables, ignore_index=True) if _tables else pd.DataFrame()
+    all_outliers = pd.concat(
+        [
+            outliers_uff_sigma.assign(force_field="UFF"),
+            outliers_uff_epsilon.assign(force_field="UFF"),
+            outliers_dreiding_sigma.assign(force_field="DREIDING"),
+            outliers_dreiding_epsilon.assign(force_field="DREIDING"),
+        ],
+        ignore_index=True,
+    )
     all_outliers
     return
 
@@ -708,6 +896,388 @@ def _(compare_dreiding, compare_uff, pd):
         ["element", "source"]
         + [c for c in combined_comparison.columns if c.endswith(("_provided", "_UFF", "_DREIDING", "_error"))]
     )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## 4. Compare any two force fields directly
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    Compare two arbitrary files element-by-element — e.g.
+    `UFF_vincent_2025.dat` against `force_field_mixing_rules.def` — with no
+    literature ground truth involved. Entries are matched by element symbol
+    and split by their embedded UFF/DREIDING source label, so a DREIDING
+    entry is never compared to a UFF entry for the same element; rows whose
+    source names neither are excluded (same rule as section 3). If either
+    file defines more than one atom type per element, only the first
+    occurrence is used (a warning is printed below).
+    """)
+    return
+
+
+@app.cell
+def _(Path, mo):
+    ff_a_browser = mo.ui.file_browser(
+        initial_path=Path("ff_data"),
+        filetypes=[".def", ".template", ".dat"],
+        multiple=False,
+        label="browse ff_data/ (force field A)",
+    )
+    ff_a_upload = mo.ui.file(
+        filetypes=[".def", ".template", ".dat"],
+        multiple=False,
+        label="...or upload (force field A)",
+    )
+    mo.hstack([ff_a_browser, ff_a_upload], justify="start", gap=2)
+    return ff_a_browser, ff_a_upload
+
+
+@app.cell
+def _(Path, mo):
+    ff_b_browser = mo.ui.file_browser(
+        initial_path=Path("ff_data"),
+        filetypes=[".def", ".template", ".dat"],
+        multiple=False,
+        label="browse ff_data/ (force field B)",
+    )
+    ff_b_upload = mo.ui.file(
+        filetypes=[".def", ".template", ".dat"],
+        multiple=False,
+        label="...or upload (force field B)",
+    )
+    mo.hstack([ff_b_browser, ff_b_upload], justify="start", gap=2)
+    return ff_b_browser, ff_b_upload
+
+
+@app.cell
+def _(PARSERS, ff_a_browser, ff_a_upload, load_force_field_file, mo):
+    ff_a_name, ff_a_suffix, ff_a_raw = load_force_field_file(ff_a_browser, ff_a_upload, PARSERS)
+    mo.md(f"Loaded **A = {ff_a_name}** as `{ff_a_suffix}` ({len(ff_a_raw)} entries).")
+    return ff_a_name, ff_a_raw
+
+
+@app.cell
+def _(PARSERS, ff_b_browser, ff_b_upload, load_force_field_file, mo):
+    ff_b_name, ff_b_suffix, ff_b_raw = load_force_field_file(ff_b_browser, ff_b_upload, PARSERS)
+    mo.md(f"Loaded **B = {ff_b_name}** as `{ff_b_suffix}` ({len(ff_b_raw)} entries).")
+    return ff_b_name, ff_b_raw
+
+
+@app.cell
+def _(
+    compute_errors,
+    coverage_summary,
+    ff_a_raw,
+    ff_b_raw,
+    mo,
+    split_by_force_field,
+):
+    a_uff, a_dreiding = split_by_force_field(ff_a_raw)
+    b_uff, b_dreiding = split_by_force_field(ff_b_raw)
+
+    pairwise_compare_uff = compute_errors(a_uff, b_uff, "_B") if len(a_uff) and len(b_uff) else None
+    pairwise_compare_dreiding = compute_errors(a_dreiding, b_dreiding, "_B") if len(a_dreiding) and len(b_dreiding) else None
+
+    _excluded_a = len(ff_a_raw) - len(a_uff) - len(a_dreiding)
+    _excluded_b = len(ff_b_raw) - len(b_uff) - len(b_dreiding)
+
+    mo.md("\n\n".join(filter(None, [
+        coverage_summary(a_uff, b_uff, "A vs B, UFF-labeled") if pairwise_compare_uff is not None else None,
+        coverage_summary(a_dreiding, b_dreiding, "A vs B, DREIDING-labeled") if pairwise_compare_dreiding is not None else None,
+        f"*(A: {_excluded_a} row(s) excluded as neither UFF- nor DREIDING-labeled)*" if _excluded_a else None,
+        f"*(B: {_excluded_b} row(s) excluded as neither UFF- nor DREIDING-labeled)*" if _excluded_b else None,
+        "**No comparable (same-label) entries found between A and B.**"
+        if pairwise_compare_uff is None and pairwise_compare_dreiding is None else None,
+    ])))
+    return pairwise_compare_dreiding, pairwise_compare_uff
+
+
+@app.cell
+def _(mo):
+    n_std_slider_pairwise = mo.ui.slider(
+        0.5, 4.0, 0.25, value=1.0, label="outlier threshold (std devs from mean)"
+    )
+    n_std_slider_pairwise
+    return (n_std_slider_pairwise,)
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    #### UFF-labeled entries: A vs B
+    """)
+    return
+
+
+@app.cell
+def _(
+    empty_outliers,
+    ff_a_name,
+    ff_b_name,
+    mo,
+    n_std_slider_pairwise,
+    pairwise_compare_uff,
+    plot_error_profile,
+):
+    if pairwise_compare_uff is not None:
+        fig_pairwise_uff_sigma, outliers_pairwise_uff_sigma = plot_error_profile(
+            pairwise_compare_uff, "sigma_ang", n_std=n_std_slider_pairwise.value,
+            title_prefix=f"{ff_a_name} vs {ff_b_name} \u00b7 ",
+        )
+        _output = fig_pairwise_uff_sigma
+    else:
+        outliers_pairwise_uff_sigma = empty_outliers()
+        _output = mo.md("*no overlapping UFF-labeled entries*")
+    _output
+    return (outliers_pairwise_uff_sigma,)
+
+
+@app.cell
+def _(
+    empty_outliers,
+    ff_a_name,
+    ff_b_name,
+    mo,
+    n_std_slider_pairwise,
+    pairwise_compare_uff,
+    plot_error_profile,
+):
+    if pairwise_compare_uff is not None:
+        fig_pairwise_uff_epsilon, outliers_pairwise_uff_epsilon = plot_error_profile(
+            pairwise_compare_uff, "epsilon_K", n_std=n_std_slider_pairwise.value,
+            title_prefix=f"{ff_a_name} vs {ff_b_name} \u00b7 ",
+        )
+        _output = fig_pairwise_uff_epsilon
+    else:
+        outliers_pairwise_uff_epsilon = empty_outliers()
+        _output = mo.md("*no overlapping UFF-labeled entries*")
+    _output
+    return (outliers_pairwise_uff_epsilon,)
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    #### DREIDING-labeled entries: A vs B
+    """)
+    return
+
+
+@app.cell
+def _(
+    empty_outliers,
+    ff_a_name,
+    ff_b_name,
+    mo,
+    n_std_slider_pairwise,
+    pairwise_compare_dreiding,
+    plot_error_profile,
+):
+    if pairwise_compare_dreiding is not None:
+        fig_pairwise_dreiding_sigma, outliers_pairwise_dreiding_sigma = plot_error_profile(
+            pairwise_compare_dreiding, "sigma_ang", n_std=n_std_slider_pairwise.value,
+            title_prefix=f"{ff_a_name} vs {ff_b_name} \u00b7 ",
+        )
+        _output = fig_pairwise_dreiding_sigma
+    else:
+        outliers_pairwise_dreiding_sigma = empty_outliers()
+        _output = mo.md("*no overlapping DREIDING-labeled entries*")
+    _output
+    return (outliers_pairwise_dreiding_sigma,)
+
+
+@app.cell
+def _(
+    empty_outliers,
+    ff_a_name,
+    ff_b_name,
+    mo,
+    n_std_slider_pairwise,
+    pairwise_compare_dreiding,
+    plot_error_profile,
+):
+    if pairwise_compare_dreiding is not None:
+        fig_pairwise_dreiding_epsilon, outliers_pairwise_dreiding_epsilon = plot_error_profile(
+            pairwise_compare_dreiding, "epsilon_K", n_std=n_std_slider_pairwise.value,
+            title_prefix=f"{ff_a_name} vs {ff_b_name} \u00b7 ",
+        )
+        _output = fig_pairwise_dreiding_epsilon
+    else:
+        outliers_pairwise_dreiding_epsilon = empty_outliers()
+        _output = mo.md("*no overlapping DREIDING-labeled entries*")
+    _output
+    return (outliers_pairwise_dreiding_epsilon,)
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### Outlier table (A vs B, current threshold)
+    """)
+    return
+
+
+@app.cell
+def _(
+    outliers_pairwise_dreiding_epsilon,
+    outliers_pairwise_dreiding_sigma,
+    outliers_pairwise_uff_epsilon,
+    outliers_pairwise_uff_sigma,
+    pd,
+):
+    pairwise_outliers = pd.concat(
+        [
+            outliers_pairwise_uff_sigma.assign(label="UFF"),
+            outliers_pairwise_uff_epsilon.assign(label="UFF"),
+            outliers_pairwise_dreiding_sigma.assign(label="DREIDING"),
+            outliers_pairwise_dreiding_epsilon.assign(label="DREIDING"),
+        ],
+        ignore_index=True,
+    )
+    pairwise_outliers
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### Full comparison table (A vs B)
+    """)
+    return
+
+
+@app.cell
+def _(pairwise_compare_dreiding, pairwise_compare_uff, pd):
+    pairwise_comparison = pd.concat(
+        [df for df in [pairwise_compare_uff, pairwise_compare_dreiding] if df is not None],
+        ignore_index=True,
+    )
+    pairwise_comparison.filter(
+        ["element", "source_provided", "source_B"]
+        + [c for c in pairwise_comparison.columns if c.endswith(("_provided", "_B", "_error"))]
+    )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## 5. Export
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    Load any file dealt with in this notebook — including the two
+    ground-truth CSVs — and re-export it in any of the four formats
+    (`.def`, `.template`, `.dat`, `.csv`). Exports always land in
+    `ff_data/exports/`; the filename defaults to the source file's name
+    with the new extension, and is editable before exporting.
+    """)
+    return
+
+
+@app.cell
+def _(Path, mo):
+    export_browser = mo.ui.file_browser(
+        initial_path=Path("ff_data"),
+        filetypes=[".def", ".template", ".dat", ".csv"],
+        multiple=False,
+        label="browse ff_data/ (file to export)",
+    )
+    export_upload = mo.ui.file(
+        filetypes=[".def", ".template", ".dat", ".csv"],
+        multiple=False,
+        label="...or upload",
+    )
+    mo.hstack([export_browser, export_upload], justify="start", gap=2)
+    return export_browser, export_upload
+
+
+@app.cell
+def _(
+    EXPORT_SOURCE_PARSERS,
+    export_browser,
+    export_upload,
+    load_force_field_file,
+    mo,
+):
+    export_source_name, export_source_suffix, export_source_df = load_force_field_file(
+        export_browser, export_upload, EXPORT_SOURCE_PARSERS
+    )
+    mo.md(f"Loaded **{export_source_name}** as `{export_source_suffix}` ({len(export_source_df)} entries).")
+    return export_source_df, export_source_name
+
+
+@app.cell
+def _(EXPORTERS, mo):
+    export_format_dropdown = mo.ui.dropdown(
+        options=list(EXPORTERS.keys()), value=".csv", label="export format"
+    )
+    export_format_dropdown
+    return (export_format_dropdown,)
+
+
+@app.cell
+def _(Path, export_format_dropdown, export_source_name, mo):
+    _default_export_name = Path(export_source_name).stem + export_format_dropdown.value
+    export_filename_input = mo.ui.text(
+        value=_default_export_name, label="export filename (editable)", full_width=True
+    )
+    export_filename_input
+    return (export_filename_input,)
+
+
+@app.cell
+def _(mo):
+    export_button = mo.ui.run_button(label="Export to ff_data/exports/")
+    export_button
+    return (export_button,)
+
+
+@app.cell
+def _(
+    EXPORTERS,
+    Path,
+    export_button,
+    export_filename_input,
+    export_format_dropdown,
+    export_source_df,
+    mo,
+):
+    EXPORTS_DIR = Path("ff_data/exports")
+
+    _target_suffix = export_format_dropdown.value
+    _safe_stem = Path(export_filename_input.value).stem
+    export_output_path = EXPORTS_DIR / f"{_safe_stem}{_target_suffix}"
+
+    _overwrite_note = " (overwriting existing file)" if export_output_path.exists() else ""
+
+    mo.stop(
+        not export_button.value,
+        mo.md(
+            f"Will write **{export_output_path}**{_overwrite_note} — "
+            "click *Export* above to proceed."
+        ),
+    )
+
+    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    _export_text = EXPORTERS[_target_suffix](export_source_df)
+    export_output_path.write_text(_export_text)
+
+    mo.vstack([
+        mo.md(f"**Wrote {export_output_path}** ({len(_export_text)} bytes, {len(export_source_df)} entries)."),
+        mo.plain_text("\n".join(_export_text.splitlines()[:15])),
+    ])
     return
 
 
